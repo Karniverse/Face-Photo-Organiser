@@ -1,0 +1,278 @@
+import os
+import shutil
+import pickle
+import cv2
+import numpy as np
+
+from insightface.app import FaceAnalysis
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+INPUT_DIR = "photos"
+OUTPUT_DIR = "sorted_photos"
+MEMORY_FILE = "face_memory.pkl"
+
+SIMILARITY_THRESHOLD = 0.45
+
+# =========================================================
+# CREATE OUTPUT FOLDER
+# =========================================================
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# =========================================================
+# LOAD MEMORY
+# =========================================================
+
+if os.path.exists(MEMORY_FILE):
+
+    print("Loading known faces from memory...")
+
+    with open(MEMORY_FILE, "rb") as f:
+        known_faces = pickle.load(f)
+
+else:
+
+    print("No existing memory found.")
+
+    known_faces = []
+
+# =========================================================
+# LOAD INSIGHTFACE
+# =========================================================
+
+print("Loading InsightFace models...")
+
+app = FaceAnalysis(
+    name='buffalo_l',
+    root='models',
+    providers=[
+        'CUDAExecutionProvider'
+    ]
+)
+
+app.prepare(
+    ctx_id=0,
+    det_size=(640, 640)
+)
+
+print("GPU Face Recognition Ready!")
+
+# =========================================================
+# COSINE SIMILARITY
+# =========================================================
+
+def cosine_similarity(a, b):
+
+    a = np.array(a)
+    b = np.array(b)
+
+    return np.dot(a, b) / (
+        np.linalg.norm(a) * np.linalg.norm(b)
+    )
+
+# =========================================================
+# PROCESS IMAGES
+# =========================================================
+
+for filename in os.listdir(INPUT_DIR):
+
+    if not filename.lower().endswith(
+        (".jpg", ".jpeg", ".png")
+    ):
+        continue
+
+    filepath = os.path.join(INPUT_DIR, filename)
+
+    print(f"\nProcessing: {filename}")
+
+    image = cv2.imread(filepath)
+
+    if image is None:
+
+        print("Could not load image.")
+        continue
+
+    # =====================================================
+    # DETECT FACES
+    # =====================================================
+
+    faces = app.get(image)
+
+    if len(faces) == 0:
+
+        print("No faces found.")
+        continue
+
+    detected_names = set()
+
+    # =====================================================
+    # PROCESS EACH FACE
+    # =====================================================
+
+    for face in faces:
+
+        embedding = face.embedding
+
+        bbox = face.bbox.astype(int)
+
+        x1, y1, x2, y2 = bbox
+
+        # padding
+        pad = 30
+
+        x1 = max(0, x1 - pad)
+        y1 = max(0, y1 - pad)
+
+        x2 = min(image.shape[1], x2 + pad)
+        y2 = min(image.shape[0], y2 + pad)
+
+        face_crop = image[y1:y2, x1:x2]
+
+        name = "Unknown"
+
+        best_similarity = -1
+
+        # =================================================
+        # COMPARE WITH MEMORY
+        # =================================================
+
+        for saved_name, saved_embedding in known_faces:
+
+            similarity = cosine_similarity(
+                embedding,
+                saved_embedding
+            )
+
+            if similarity > best_similarity:
+
+                best_similarity = similarity
+
+                if similarity > SIMILARITY_THRESHOLD:
+
+                    name = saved_name
+
+        # =================================================
+        # NEW FACE
+        # =================================================
+
+        if name == "Unknown":
+
+            cv2.imshow(
+                "Unknown Face",
+                face_crop
+            )
+
+            cv2.waitKey(1)
+
+            print(
+                "\nNew face detected!"
+            )
+
+            name = input(
+                "Enter name "
+                "(or type skip): "
+            ).strip()
+
+            cv2.destroyAllWindows()
+
+            if (
+                name != ""
+                and
+                name.lower() != "skip"
+            ):
+
+                known_faces.append(
+                    (name, embedding)
+                )
+
+                with open(
+                    MEMORY_FILE,
+                    "wb"
+                ) as f:
+
+                    pickle.dump(
+                        known_faces,
+                        f
+                    )
+
+                print(
+                    f"Saved {name} "
+                    "to memory!"
+                )
+
+        # =================================================
+        # SAVE DETECTED NAME
+        # =================================================
+
+        if (
+            name != ""
+            and
+            name.lower() != "skip"
+        ):
+
+            detected_names.add(name)
+
+    # =====================================================
+    # SORT FILES
+    # =====================================================
+
+    for person_name in detected_names:
+
+        person_dir = os.path.join(
+            OUTPUT_DIR,
+            person_name
+        )
+
+        os.makedirs(
+            person_dir,
+            exist_ok=True
+        )
+
+        destination = os.path.join(
+            person_dir,
+            filename
+        )
+
+        if not os.path.exists(destination):
+
+            shutil.copy(
+                filepath,
+                destination
+            )
+
+    # =====================================================
+    # DELETE ORIGINAL
+    # =====================================================
+
+    if len(detected_names) > 0:
+
+        print(
+            "Saved to:",
+            ", ".join(detected_names)
+        )
+
+        try:
+
+            os.remove(filepath)
+
+            print(
+                f"Removed original: "
+                f"{filename}"
+            )
+
+        except Exception as e:
+
+            print(
+                f"Delete failed: {e}"
+            )
+
+    else:
+
+        print(
+            "No recognized faces saved."
+        )
+
+print("\nAll done!")
