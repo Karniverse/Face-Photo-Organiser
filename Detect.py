@@ -6,6 +6,7 @@ import numpy as np
 
 from insightface.app import FaceAnalysis
 
+
 # =========================================================
 # CONFIG
 # =========================================================
@@ -15,12 +16,24 @@ OUTPUT_DIR = "sorted_photos"
 MEMORY_FILE = "face_memory.pkl"
 
 SIMILARITY_THRESHOLD = 0.45
+VIDEO_CONFIRM_COUNT = 4
 
-# =========================================================
-# CREATE OUTPUT FOLDER
-# =========================================================
+IMAGE_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png"
+)
+
+VIDEO_EXTENSIONS = (
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".mkv",
+    ".webm"
+)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 
 # =========================================================
 # LOAD MEMORY
@@ -35,12 +48,13 @@ if os.path.exists(MEMORY_FILE):
 
 else:
 
-    print("No existing memory found.")
+    print("No memory found")
 
-    known_faces = []
+    known_faces=[]
+
 
 # =========================================================
-# LOAD INSIGHTFACE
+# LOAD GPU MODEL
 # =========================================================
 
 print("Loading InsightFace models...")
@@ -55,110 +69,61 @@ app = FaceAnalysis(
 
 app.prepare(
     ctx_id=0,
-    det_size=(640, 640)
+    det_size=(640,640)
 )
 
 print("GPU Face Recognition Ready!")
+
 
 # =========================================================
 # COSINE SIMILARITY
 # =========================================================
 
-def cosine_similarity(a, b):
+def cosine_similarity(a,b):
 
-    a = np.array(a)
-    b = np.array(b)
+    a=np.array(a)
+    b=np.array(b)
 
-    return np.dot(a, b) / (
-        np.linalg.norm(a) * np.linalg.norm(b)
+    return np.dot(a,b)/(
+        np.linalg.norm(a)*
+        np.linalg.norm(b)
     )
 
+
 # =========================================================
-# PROCESS IMAGES
+# RECOGNIZE FACE
 # =========================================================
 
-for filename in os.listdir(INPUT_DIR):
+def recognize_face(
+        embedding,
+        image=None,
+        face_crop=None
+):
 
-    if not filename.lower().endswith(
-        (".jpg", ".jpeg", ".png")
-    ):
-        continue
+    global known_faces
 
-    filepath = os.path.join(INPUT_DIR, filename)
+    name="Unknown"
 
-    print(f"\nProcessing: {filename}")
+    best_similarity=-1
 
-    image = cv2.imread(filepath)
+    for saved_name,saved_embedding in known_faces:
 
-    if image is None:
+        similarity=cosine_similarity(
+            embedding,
+            saved_embedding
+        )
 
-        print("Could not load image.")
-        continue
+        if similarity>best_similarity:
 
-    # =====================================================
-    # DETECT FACES
-    # =====================================================
+            best_similarity=similarity
 
-    faces = app.get(image)
+            if similarity>SIMILARITY_THRESHOLD:
 
-    if len(faces) == 0:
+                name=saved_name
 
-        print("No faces found.")
-        continue
+    if name=="Unknown":
 
-    detected_names = set()
-
-    # =====================================================
-    # PROCESS EACH FACE
-    # =====================================================
-
-    for face in faces:
-
-        embedding = face.embedding
-
-        bbox = face.bbox.astype(int)
-
-        x1, y1, x2, y2 = bbox
-
-        # padding
-        pad = 30
-
-        x1 = max(0, x1 - pad)
-        y1 = max(0, y1 - pad)
-
-        x2 = min(image.shape[1], x2 + pad)
-        y2 = min(image.shape[0], y2 + pad)
-
-        face_crop = image[y1:y2, x1:x2]
-
-        name = "Unknown"
-
-        best_similarity = -1
-
-        # =================================================
-        # COMPARE WITH MEMORY
-        # =================================================
-
-        for saved_name, saved_embedding in known_faces:
-
-            similarity = cosine_similarity(
-                embedding,
-                saved_embedding
-            )
-
-            if similarity > best_similarity:
-
-                best_similarity = similarity
-
-                if similarity > SIMILARITY_THRESHOLD:
-
-                    name = saved_name
-
-        # =================================================
-        # NEW FACE
-        # =================================================
-
-        if name == "Unknown":
+        if face_crop is not None:
 
             cv2.imshow(
                 "Unknown Face",
@@ -167,61 +132,277 @@ for filename in os.listdir(INPUT_DIR):
 
             cv2.waitKey(1)
 
-            print(
-                "\nNew face detected!"
-            )
+        name=input(
+            "\nNew face detected.\n"
+            "Enter name "
+            "(skip to ignore): "
+        ).strip()
 
-            name = input(
-                "Enter name "
-                "(or type skip): "
-            ).strip()
+        cv2.destroyAllWindows()
 
-            cv2.destroyAllWindows()
-
-            if (
-                name != ""
-                and
-                name.lower() != "skip"
-            ):
-
-                known_faces.append(
-                    (name, embedding)
-                )
-
-                with open(
-                    MEMORY_FILE,
-                    "wb"
-                ) as f:
-
-                    pickle.dump(
-                        known_faces,
-                        f
-                    )
-
-                print(
-                    f"Saved {name} "
-                    "to memory!"
-                )
-
-        # =================================================
-        # SAVE DETECTED NAME
-        # =================================================
+        name=name.strip("[](){}")
 
         if (
-            name != ""
+            name!=""
             and
-            name.lower() != "skip"
+            name.lower()!="skip"
         ):
 
-            detected_names.add(name)
+            known_faces.append(
+                (
+                    name,
+                    embedding
+                )
+            )
 
-    # =====================================================
-    # SORT FILES
-    # =====================================================
+            with open(
+                MEMORY_FILE,
+                "wb"
+            ) as f:
+
+                pickle.dump(
+                    known_faces,
+                    f
+                )
+
+            print(
+                f"Saved {name}"
+            )
+
+    return name
+
+
+# =========================================================
+# VIDEO FRAME EXTRACTION
+# =========================================================
+
+def extract_video_frames(
+        video_path
+):
+
+    cap=cv2.VideoCapture(
+        video_path
+    )
+
+    fps=cap.get(
+        cv2.CAP_PROP_FPS
+    )
+
+    if fps<=0:
+        fps=30
+
+    interval=int(fps)
+
+    frames=[]
+
+    frame_number=0
+
+    while True:
+
+        success,frame=cap.read()
+
+        if not success:
+            break
+
+        if frame_number%interval==0:
+
+            frames.append(
+                frame
+            )
+
+        frame_number+=1
+
+    cap.release()
+
+    return frames
+
+
+# =========================================================
+# PROCESS IMAGE
+# =========================================================
+
+def process_image(
+        image,
+        detected_names
+):
+
+    faces=app.get(
+        image
+    )
+
+    for face in faces:
+
+        embedding=face.embedding
+
+        bbox=face.bbox.astype(
+            int
+        )
+
+        x1,y1,x2,y2=bbox
+
+        pad=30
+
+        x1=max(
+            0,
+            x1-pad
+        )
+
+        y1=max(
+            0,
+            y1-pad
+        )
+
+        x2=min(
+            image.shape[1],
+            x2+pad
+        )
+
+        y2=min(
+            image.shape[0],
+            y2+pad
+        )
+
+        face_crop=image[
+            y1:y2,
+            x1:x2
+        ]
+
+        name=recognize_face(
+            embedding,
+            image,
+            face_crop
+        )
+
+        if (
+            name!=""
+            and
+            name.lower()!="skip"
+        ):
+
+            detected_names.add(
+                name
+            )
+
+
+# =========================================================
+# MAIN LOOP
+# =========================================================
+
+for filename in os.listdir(
+        INPUT_DIR
+):
+
+    filepath=os.path.join(
+        INPUT_DIR,
+        filename
+    )
+
+    print(
+        f"\nProcessing: "
+        f"{filename}"
+    )
+
+    detected_names=set()
+
+    extension=os.path.splitext(
+        filename
+    )[1].lower()
+
+
+    # ====================================
+    # IMAGE
+    # ====================================
+
+    if extension in IMAGE_EXTENSIONS:
+
+        image=cv2.imread(
+            filepath
+        )
+
+        if image is None:
+
+            continue
+
+        process_image(
+            image,
+            detected_names
+        )
+
+
+    # ====================================
+    # VIDEO
+    # ====================================
+
+    elif extension in VIDEO_EXTENSIONS:
+
+        frames=extract_video_frames(
+            filepath
+        )
+
+        vote_counter={}
+
+        for frame in frames:
+
+            faces=app.get(
+                frame
+            )
+
+            for face in faces:
+
+                embedding=face.embedding
+
+                name=recognize_face(
+                    embedding
+                )
+
+                if (
+                    name=="Unknown"
+                    or
+                    name=="skip"
+                ):
+                    continue
+
+                vote_counter[
+                    name
+                ]=vote_counter.get(
+                    name,
+                    0
+                )+1
+
+                if vote_counter[
+                    name
+                ]>=VIDEO_CONFIRM_COUNT:
+
+                    detected_names.add(
+                        name
+                    )
+
+                    print(
+                        f"Video identified as "
+                        f"{name}"
+                    )
+
+                    break
+
+            if len(
+                detected_names
+            )>0:
+
+                break
+
+
+    else:
+
+        continue
+
+
+    # ====================================
+    # SORT
+    # ====================================
 
     for person_name in detected_names:
 
-        person_dir = os.path.join(
+        person_dir=os.path.join(
             OUTPUT_DIR,
             person_name
         )
@@ -231,48 +412,41 @@ for filename in os.listdir(INPUT_DIR):
             exist_ok=True
         )
 
-        destination = os.path.join(
+        destination=os.path.join(
             person_dir,
             filename
         )
 
-        if not os.path.exists(destination):
+        if not os.path.exists(
+                destination
+        ):
 
             shutil.copy(
                 filepath,
                 destination
             )
 
-    # =====================================================
-    # DELETE ORIGINAL
-    # =====================================================
 
-    if len(detected_names) > 0:
+    if detected_names:
 
         print(
             "Saved to:",
-            ", ".join(detected_names)
+            ", ".join(
+                detected_names
+            )
         )
 
-        try:
-
-            os.remove(filepath)
-
-            print(
-                f"Removed original: "
-                f"{filename}"
-            )
-
-        except Exception as e:
-
-            print(
-                f"Delete failed: {e}"
-            )
+        os.remove(
+            filepath
+        )
 
     else:
 
         print(
-            "No recognized faces saved."
+            "No faces saved."
         )
 
-print("\nAll done!")
+
+print(
+    "\nAll done!"
+)
