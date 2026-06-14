@@ -21,7 +21,8 @@ VIDEO_CONFIRM_COUNT = 4
 IMAGE_EXTENSIONS = (
     ".jpg",
     ".jpeg",
-    ".png"
+    ".png",
+    ".webp"
 )
 
 VIDEO_EXTENSIONS = (
