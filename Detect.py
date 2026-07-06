@@ -1,10 +1,17 @@
 import os
 import shutil
 import pickle
+import base64
+import time
 import cv2
 import numpy as np
+import requests
 
+from dotenv import load_dotenv
 from insightface.app import FaceAnalysis
+
+
+load_dotenv()
 
 
 # =========================================================
@@ -17,6 +24,25 @@ MEMORY_FILE = "face_memory.pkl"
 
 SIMILARITY_THRESHOLD = 0.45
 VIDEO_CONFIRM_COUNT = 4
+
+GEMINI_API_KEY = os.getenv(
+    "GEMINI_API_KEY",
+    ""
+)
+
+GEMINI_MODEL = "gemini-2.0-flash"
+
+GROQ_API_KEY = os.getenv(
+    "GROQ_API_KEY",
+    ""
+)
+
+GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+
+# Seconds between API calls
+API_COOLDOWN = 4
+
+last_api_call = 0
 
 IMAGE_EXTENSIONS = (
     ".jpg",
@@ -92,18 +118,12 @@ def cosine_similarity(a,b):
 
 
 # =========================================================
-# RECOGNIZE FACE
+# MATCH FACE (SILENT - NO PROMPTING)
 # =========================================================
 
-def recognize_face(
-        embedding,
-        image=None,
-        face_crop=None
-):
+def match_face(embedding):
 
-    global known_faces
-
-    name="Unknown"
+    best_name="Unknown"
 
     best_similarity=-1
 
@@ -120,57 +140,9 @@ def recognize_face(
 
             if similarity>SIMILARITY_THRESHOLD:
 
-                name=saved_name
+                best_name=saved_name
 
-    if name=="Unknown":
-
-        if face_crop is not None:
-
-            cv2.imshow(
-                "Unknown Face",
-                face_crop
-            )
-
-            cv2.waitKey(1)
-
-        name=input(
-            "\nNew face detected.\n"
-            "Enter name "
-            "(skip to ignore): "
-        ).strip()
-
-        cv2.destroyAllWindows()
-
-        name=name.strip("[](){}")
-
-        if (
-            name!=""
-            and
-            name.lower()!="skip"
-        ):
-
-            known_faces.append(
-                (
-                    name,
-                    embedding
-                )
-            )
-
-            with open(
-                MEMORY_FILE,
-                "wb"
-            ) as f:
-
-                pickle.dump(
-                    known_faces,
-                    f
-                )
-
-            print(
-                f"Saved {name}"
-            )
-
-    return name
+    return best_name
 
 
 # =========================================================
@@ -219,75 +191,362 @@ def extract_video_frames(
 
 
 # =========================================================
-# PROCESS IMAGE
+# CROP FACE FROM IMAGE
 # =========================================================
 
-def process_image(
-        image,
-        detected_names
-):
+def crop_face(image,face):
 
-    faces=app.get(
-        image
+    bbox=face.bbox.astype(
+        int
     )
 
-    for face in faces:
+    x1,y1,x2,y2=bbox
 
-        embedding=face.embedding
+    pad=30
 
-        bbox=face.bbox.astype(
-            int
+    x1=max(0,x1-pad)
+
+    y1=max(0,y1-pad)
+
+    x2=min(
+        image.shape[1],
+        x2+pad
+    )
+
+    y2=min(
+        image.shape[0],
+        y2+pad
+    )
+
+    return image[y1:y2,x1:x2]
+
+
+# =========================================================
+# SORT FILE TO PERSON FOLDER
+# =========================================================
+
+def sort_file(
+        filepath,
+        filename,
+        person_name
+):
+
+    person_dir=os.path.join(
+        OUTPUT_DIR,
+        person_name
+    )
+
+    os.makedirs(
+        person_dir,
+        exist_ok=True
+    )
+
+    destination=os.path.join(
+        person_dir,
+        filename
+    )
+
+    if not os.path.exists(
+            destination
+    ):
+
+        shutil.copy(
+            filepath,
+            destination
         )
 
-        x1,y1,x2,y2=bbox
 
-        pad=30
+# =========================================================
+# IDENTIFY CELEBRITY (API)
+# =========================================================
 
-        x1=max(
-            0,
-            x1-pad
+CELEB_PROMPT = (
+    "Identify this person. "
+    "Reply with ONLY their "
+    "full name in UPPERCASE. "
+    "If you cannot identify "
+    "them, reply with "
+    "exactly 'Unknown'."
+)
+
+
+def identify_via_gemini(image_b64):
+
+    url = (
+        "https://generativelanguage"
+        ".googleapis.com/v1beta/"
+        f"models/{GEMINI_MODEL}"
+        ":generateContent"
+        f"?key={GEMINI_API_KEY}"
+    )
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {
+                    "text": CELEB_PROMPT
+                },
+                {
+                    "inline_data": {
+                        "mime_type":
+                            "image/jpeg",
+                        "data":
+                            image_b64
+                    }
+                }
+            ]
+        }]
+    }
+
+    response = requests.post(
+        url,
+        json=payload,
+        timeout=15
+    )
+
+    data = response.json()
+
+    # Check for API errors
+    if 'error' in data:
+
+        msg = data[
+            'error'
+        ].get('message', '')
+
+        print(
+            f"  [Gemini: {msg[:80]}]"
         )
 
-        y1=max(
-            0,
-            y1-pad
+        return None
+
+    # Check for blocked response
+    if (
+        'candidates' not in data
+        or
+        len(data['candidates']) == 0
+    ):
+
+        block_reason = data.get(
+            'promptFeedback', {}
+        ).get(
+            'blockReason',
+            'unknown reason'
         )
 
-        x2=min(
-            image.shape[1],
-            x2+pad
+        print(
+            f"  [Gemini blocked: "
+            f"{block_reason}]"
         )
 
-        y2=min(
-            image.shape[0],
-            y2+pad
+        return None
+
+    # Check finish reason
+    finish = data[
+        'candidates'
+    ][0].get(
+        'finishReason',
+        ''
+    )
+
+    if finish == 'SAFETY':
+
+        print(
+            "  [Gemini blocked by "
+            "safety filter]"
         )
 
-        face_crop=image[
-            y1:y2,
-            x1:x2
-        ]
+        return None
 
-        name=recognize_face(
-            embedding,
-            image,
+    name = data[
+        'candidates'
+    ][0][
+        'content'
+    ][
+        'parts'
+    ][0][
+        'text'
+    ].strip()
+
+    if (
+        name.lower() == "unknown"
+        or
+        name == ""
+    ):
+        return None
+
+    return name
+
+
+def identify_via_groq(image_b64):
+
+    url = (
+        "https://api.groq.com"
+        "/openai/v1/"
+        "chat/completions"
+    )
+
+    headers = {
+        "Authorization":
+            f"Bearer {GROQ_API_KEY}",
+        "Content-Type":
+            "application/json"
+    }
+
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": CELEB_PROMPT
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url":
+                            "data:image/jpeg;"
+                            "base64,"
+                            + image_b64
+                    }
+                }
+            ]
+        }],
+        "max_tokens": 100
+    }
+
+    response = requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=15
+    )
+
+    data = response.json()
+
+    # Check for API errors
+    if 'error' in data:
+
+        msg = data[
+            'error'
+        ].get('message', '')
+
+        print(
+            f"  [Groq: {msg[:80]}]"
+        )
+
+        return None
+
+    name = data[
+        'choices'
+    ][0][
+        'message'
+    ][
+        'content'
+    ].strip()
+
+    if (
+        name.lower() == "unknown"
+        or
+        name == ""
+    ):
+        return None
+
+    return name
+
+
+def identify_celebrity(face_crop):
+
+    global last_api_call
+
+    if (
+        not GEMINI_API_KEY
+        and
+        not GROQ_API_KEY
+    ):
+        return None
+
+    try:
+
+        # Rate limiting
+        elapsed = time.time() - last_api_call
+
+        if elapsed < API_COOLDOWN:
+
+            time.sleep(
+                API_COOLDOWN - elapsed
+            )
+
+        # Encode face crop
+        _, buffer = cv2.imencode(
+            '.jpg',
             face_crop
         )
 
-        if (
-            name!=""
-            and
-            name.lower()!="skip"
-        ):
+        image_b64 = base64.b64encode(
+            buffer
+        ).decode()
 
-            detected_names.add(
-                name
+        last_api_call = time.time()
+
+        # Try Gemini first
+        if GEMINI_API_KEY:
+
+            result = identify_via_gemini(
+                image_b64
             )
 
+            if result:
+                return result
+
+        # Fallback to Groq
+        if GROQ_API_KEY:
+
+            result = identify_via_groq(
+                image_b64
+            )
+
+            if result:
+                return result
+
+        return None
+
+    except Exception as e:
+
+        print(
+            f"  [API error: {e}]"
+        )
+
+        return None
+
 
 # =========================================================
-# MAIN LOOP
+# DATA STRUCTURES
 # =========================================================
+
+# Queue of unknown face encounters
+# Each entry: {
+#     'embedding', 'face_crop',
+#     'filepath', 'filename'
+# }
+unknown_queue=[]
+
+# Track detected names per file
+# filepath -> {
+#     'filename', 'names': set()
+# }
+file_detections={}
+
+
+# =========================================================
+# PASS 1 : SILENT RECOGNITION
+# =========================================================
+
+print(
+    "\n========== PASS 1: "
+    "Recognising known faces "
+    "=========="
+)
 
 for filename in os.listdir(
         INPUT_DIR
@@ -298,16 +557,23 @@ for filename in os.listdir(
         filename
     )
 
+    extension=os.path.splitext(
+        filename
+    )[1].lower()
+
+    if (
+        extension not in IMAGE_EXTENSIONS
+        and
+        extension not in VIDEO_EXTENSIONS
+    ):
+        continue
+
     print(
         f"\nProcessing: "
         f"{filename}"
     )
 
     detected_names=set()
-
-    extension=os.path.splitext(
-        filename
-    )[1].lower()
 
 
     # ====================================
@@ -321,13 +587,39 @@ for filename in os.listdir(
         )
 
         if image is None:
-
             continue
 
-        process_image(
-            image,
-            detected_names
+        faces=app.get(
+            image
         )
+
+        for face in faces:
+
+            embedding=face.embedding
+
+            face_crop=crop_face(
+                image,
+                face
+            )
+
+            name=match_face(
+                embedding
+            )
+
+            if name!="Unknown":
+
+                detected_names.add(
+                    name
+                )
+
+            else:
+
+                unknown_queue.append({
+                    'embedding':embedding,
+                    'face_crop':face_crop,
+                    'filepath':filepath,
+                    'filename':filename
+                })
 
 
     # ====================================
@@ -342,6 +634,8 @@ for filename in os.listdir(
 
         vote_counter={}
 
+        video_unknowns=[]
+
         for frame in frames:
 
             faces=app.get(
@@ -352,99 +646,386 @@ for filename in os.listdir(
 
                 embedding=face.embedding
 
-                name=recognize_face(
+                name=match_face(
                     embedding
                 )
 
-                if (
-                    name=="Unknown"
-                    or
-                    name=="skip"
-                ):
-                    continue
+                # Known face - vote
+                if name!="Unknown":
 
-                vote_counter[
-                    name
-                ]=vote_counter.get(
-                    name,
-                    0
-                )+1
-
-                if vote_counter[
-                    name
-                ]>=VIDEO_CONFIRM_COUNT:
-
-                    detected_names.add(
+                    vote_counter[
                         name
-                    )
+                    ]=vote_counter.get(
+                        name,
+                        0
+                    )+1
 
-                    print(
-                        f"Video identified as "
-                        f"{name}"
-                    )
+                    if vote_counter[
+                        name
+                    ]>=VIDEO_CONFIRM_COUNT:
 
-                    break
+                        detected_names.add(
+                            name
+                        )
 
-            if len(
-                detected_names
-            )>0:
+                # Unknown face - cluster
+                else:
 
-                break
+                    matched_existing=False
 
+                    for existing in video_unknowns:
 
-    else:
+                        sim=cosine_similarity(
+                            embedding,
+                            existing[
+                                'embedding'
+                            ]
+                        )
 
-        continue
+                        if sim>SIMILARITY_THRESHOLD:
+
+                            existing[
+                                'count'
+                            ]+=1
+
+                            existing[
+                                'face_crop'
+                            ]=crop_face(
+                                frame,
+                                face
+                            )
+
+                            matched_existing=True
+
+                            break
+
+                    if not matched_existing:
+
+                        video_unknowns.append({
+                            'embedding':
+                                embedding,
+                            'face_crop':
+                                crop_face(
+                                    frame,
+                                    face
+                                ),
+                            'count':1
+                        })
+
+        # Queue confirmed unknowns
+        for unknown in video_unknowns:
+
+            if (
+                unknown['count']
+                >=
+                VIDEO_CONFIRM_COUNT
+            ):
+
+                unknown_queue.append({
+                    'embedding':
+                        unknown['embedding'],
+                    'face_crop':
+                        unknown['face_crop'],
+                    'filepath':filepath,
+                    'filename':filename
+                })
 
 
     # ====================================
-    # SORT
+    # SORT KNOWN FACES
     # ====================================
-
-    for person_name in detected_names:
-
-        person_dir=os.path.join(
-            OUTPUT_DIR,
-            person_name
-        )
-
-        os.makedirs(
-            person_dir,
-            exist_ok=True
-        )
-
-        destination=os.path.join(
-            person_dir,
-            filename
-        )
-
-        if not os.path.exists(
-                destination
-        ):
-
-            shutil.copy(
-                filepath,
-                destination
-            )
-
 
     if detected_names:
 
+        file_detections[filepath]={
+            'filename':filename,
+            'names':set(detected_names)
+        }
+
+        for person_name in detected_names:
+
+            sort_file(
+                filepath,
+                filename,
+                person_name
+            )
+
         print(
-            "Saved to:",
-            ", ".join(
+            "  -> "
+            +", ".join(
                 detected_names
             )
-        )
-
-        os.remove(
-            filepath
         )
 
     else:
 
         print(
-            "No faces saved."
+            "  -> No known faces"
+        )
+
+
+# =========================================================
+# PASS 2 : RESOLVE UNKNOWNS
+# =========================================================
+
+if len(unknown_queue)>0:
+
+    print(
+        f"\n========== PASS 2: "
+        f"{len(unknown_queue)} "
+        f"unknown face(s) "
+        f"to identify =========="
+    )
+
+    while len(unknown_queue)>0:
+
+        entry=unknown_queue.pop(0)
+
+        embedding=entry['embedding']
+        face_crop=entry['face_crop']
+        filepath=entry['filepath']
+        filename=entry['filename']
+
+        # Re-check (may have been identified
+        # by a previous iteration)
+        name=match_face(embedding)
+
+        if name!="Unknown":
+
+            if filepath not in file_detections:
+
+                file_detections[filepath]={
+                    'filename':filename,
+                    'names':set()
+                }
+
+            file_detections[
+                filepath
+            ]['names'].add(name)
+
+            sort_file(
+                filepath,
+                filename,
+                name
+            )
+
+            print(
+                f"\nAuto-matched: "
+                f"{filename} -> {name}"
+            )
+
+            continue
+
+        # Show face
+        if face_crop is not None:
+
+            cv2.imshow(
+                "Unknown Face",
+                face_crop
+            )
+
+            cv2.waitKey(1)
+
+        print(
+            f"\nFile: {filename}"
+        )
+
+        # Try Gemini auto-identification
+        suggested=identify_celebrity(
+            face_crop
+        )
+
+        if suggested:
+
+            print(
+                f"Gemini suggests: "
+                f"{suggested}"
+            )
+
+            confirm=input(
+                "Confirm? "
+                "(y/yes/name/skip): "
+            ).strip()
+
+            cv2.destroyAllWindows()
+
+            confirm=confirm.strip(
+                "[](){}"
+            )
+
+            if (
+                confirm.lower()=="y"
+                or
+                confirm.lower()=="yes"
+            ):
+
+                name=suggested
+
+            elif (
+                confirm==""
+                or
+                confirm.lower()=="skip"
+            ):
+
+                continue
+
+            else:
+
+                name=confirm
+
+        else:
+
+            if suggested is None and GEMINI_API_KEY:
+
+                print(
+                    "Could not auto-identify."
+                )
+
+            name=input(
+                "Enter name "
+                "(skip to ignore): "
+            ).strip()
+
+            cv2.destroyAllWindows()
+
+            name=name.strip("[](){}")
+
+            if (
+                name==""
+                or
+                name.lower()=="skip"
+            ):
+                continue
+
+        # Save to memory
+        known_faces.append(
+            (
+                name,
+                embedding
+            )
+        )
+
+        with open(
+            MEMORY_FILE,
+            "wb"
+        ) as f:
+
+            pickle.dump(
+                known_faces,
+                f
+            )
+
+        print(
+            f"Saved {name}"
+        )
+
+        # Sort this file
+        if filepath not in file_detections:
+
+            file_detections[filepath]={
+                'filename':filename,
+                'names':set()
+            }
+
+        file_detections[
+            filepath
+        ]['names'].add(name)
+
+        sort_file(
+            filepath,
+            filename,
+            name
+        )
+
+        # Re-scan remaining queue
+        auto_matched=0
+
+        remaining=[]
+
+        for queued in unknown_queue:
+
+            q_name=match_face(
+                queued['embedding']
+            )
+
+            if q_name!="Unknown":
+
+                q_filepath=queued[
+                    'filepath'
+                ]
+
+                q_filename=queued[
+                    'filename'
+                ]
+
+                if (
+                    q_filepath
+                    not in
+                    file_detections
+                ):
+
+                    file_detections[
+                        q_filepath
+                    ]={
+                        'filename':
+                            q_filename,
+                        'names':set()
+                    }
+
+                file_detections[
+                    q_filepath
+                ]['names'].add(
+                    q_name
+                )
+
+                sort_file(
+                    q_filepath,
+                    q_filename,
+                    q_name
+                )
+
+                auto_matched+=1
+
+            else:
+
+                remaining.append(
+                    queued
+                )
+
+        unknown_queue[:]=remaining
+
+        if auto_matched>0:
+
+            print(
+                f"Auto-matched "
+                f"{auto_matched} more "
+                f"file(s) as {name}"
+            )
+
+else:
+
+    print(
+        "\nNo unknown faces found."
+    )
+
+
+# =========================================================
+# CLEANUP : DELETE SORTED ORIGINALS
+# =========================================================
+
+print(
+    "\n========== Cleanup =========="
+)
+
+for filepath in file_detections:
+
+    if os.path.exists(filepath):
+
+        os.remove(filepath)
+
+        print(
+            f"Removed: "
+            f"{file_detections[filepath]['filename']}"
         )
 
 
