@@ -261,7 +261,11 @@ def sort_file(
 # =========================================================
 
 CELEB_PROMPT = (
-    "Identify this person. "
+    "Look at this image. "
+    "Identify the person in "
+    "this photo. If there are "
+    "multiple people, identify "
+    "the most prominent face. "
     "Reply with ONLY their "
     "full name in UPPERCASE. "
     "If you cannot identify "
@@ -455,7 +459,11 @@ def identify_via_groq(image_b64):
     return name
 
 
-def identify_celebrity(face_crop):
+def identify_celebrity(
+        face_crop,
+        filepath=None,
+        frame=None
+):
 
     global last_api_call
 
@@ -477,15 +485,53 @@ def identify_celebrity(face_crop):
                 API_COOLDOWN - elapsed
             )
 
-        # Encode face crop
-        _, buffer = cv2.imencode(
-            '.jpg',
-            face_crop
-        )
+        # Use full image if available
+        # (much better for identification)
+        image_b64 = None
 
-        image_b64 = base64.b64encode(
-            buffer
-        ).decode()
+        if filepath and os.path.exists(
+                filepath
+        ):
+
+            ext = os.path.splitext(
+                filepath
+            )[1].lower()
+
+            if ext in IMAGE_EXTENSIONS:
+
+                with open(
+                    filepath, 'rb'
+                ) as f:
+
+                    image_b64 = (
+                        base64.b64encode(
+                            f.read()
+                        ).decode()
+                    )
+
+        # Fallback to full frame (video)
+        if image_b64 is None and frame is not None:
+
+            _, buffer = cv2.imencode(
+                '.jpg',
+                frame
+            )
+
+            image_b64 = base64.b64encode(
+                buffer
+            ).decode()
+
+        # Fallback to face crop
+        if image_b64 is None:
+
+            _, buffer = cv2.imencode(
+                '.jpg',
+                face_crop
+            )
+
+            image_b64 = base64.b64encode(
+                buffer
+            ).decode()
 
         last_api_call = time.time()
 
@@ -695,6 +741,10 @@ for filename in os.listdir(
                                 face
                             )
 
+                            existing[
+                                'frame'
+                            ]=frame.copy()
+
                             matched_existing=True
 
                             break
@@ -709,6 +759,8 @@ for filename in os.listdir(
                                     frame,
                                     face
                                 ),
+                            'frame':
+                                frame.copy(),
                             'count':1
                         })
 
@@ -726,6 +778,8 @@ for filename in os.listdir(
                         unknown['embedding'],
                     'face_crop':
                         unknown['face_crop'],
+                    'frame':
+                        unknown['frame'],
                     'filepath':filepath,
                     'filename':filename
                 })
@@ -830,9 +884,11 @@ if len(unknown_queue)>0:
             f"\nFile: {filename}"
         )
 
-        # Try Gemini auto-identification
+        # Try auto-identification
         suggested=identify_celebrity(
-            face_crop
+            face_crop,
+            filepath,
+            entry.get('frame')
         )
 
         if suggested:
