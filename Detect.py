@@ -1,17 +1,132 @@
 import os
+import sys
 import shutil
 import pickle
-import base64
-import time
+import ctypes
 import cv2
 import numpy as np
-import requests
 
 from dotenv import load_dotenv
 from insightface.app import FaceAnalysis
 
 
 load_dotenv()
+
+
+# =========================================================
+# PRE-FILLED INPUT (Windows console API)
+# =========================================================
+
+def _win32_inject(text):
+
+    from ctypes import wintypes
+
+    class CHAR_UNION(ctypes.Union):
+        _fields_ = [
+            ("UnicodeChar",
+                ctypes.c_wchar),
+            ("AsciiChar",
+                ctypes.c_char),
+        ]
+
+    class KEY_EVENT(ctypes.Structure):
+        _fields_ = [
+            ("bKeyDown",
+                wintypes.BOOL),
+            ("wRepeatCount",
+                wintypes.WORD),
+            ("wVirtualKeyCode",
+                wintypes.WORD),
+            ("wVirtualScanCode",
+                wintypes.WORD),
+            ("uChar",
+                CHAR_UNION),
+            ("dwControlKeyState",
+                wintypes.DWORD),
+        ]
+
+    class INPUT_UNION(ctypes.Union):
+        _fields_ = [
+            ("KeyEvent", KEY_EVENT)
+        ]
+
+    class INPUT_RECORD(ctypes.Structure):
+        _fields_ = [
+            ("EventType",
+                wintypes.WORD),
+            ("Event",
+                INPUT_UNION),
+        ]
+
+    handle = (
+        ctypes.windll.kernel32
+        .GetStdHandle(
+            wintypes.DWORD(
+                0xFFFFFFF6
+            )
+        )
+    )
+
+    records = []
+
+    for ch in text:
+
+        r = INPUT_RECORD()
+        r.EventType = 0x0001
+        r.Event.KeyEvent.bKeyDown = True
+        r.Event.KeyEvent.wRepeatCount = 1
+        r.Event.KeyEvent.uChar\
+            .UnicodeChar = ch
+        records.append(r)
+
+        r2 = INPUT_RECORD()
+        r2.EventType = 0x0001
+        r2.Event.KeyEvent.bKeyDown = False
+        r2.Event.KeyEvent.wRepeatCount = 1
+        r2.Event.KeyEvent.uChar\
+            .UnicodeChar = ch
+        records.append(r2)
+
+    arr = (
+        INPUT_RECORD * len(records)
+    )(*records)
+
+    written = wintypes.DWORD(0)
+
+    ctypes.windll.kernel32\
+        .WriteConsoleInputW(
+            handle,
+            arr,
+            len(records),
+            ctypes.byref(written)
+        )
+
+
+def input_prefilled(prompt, prefill=''):
+
+    if not prefill:
+        return input(prompt)
+
+    if sys.platform == 'win32':
+
+        _win32_inject(prefill)
+        return input(prompt)
+
+    # Linux/Mac fallback
+    try:
+        import readline
+        readline.set_startup_hook(
+            lambda:
+                readline.insert_text(
+                    prefill
+                )
+        )
+        try:
+            return input(prompt)
+        finally:
+            readline.set_startup_hook()
+    except ImportError:
+        return input(prompt)
 
 
 # =========================================================
@@ -24,25 +139,6 @@ MEMORY_FILE = "face_memory.pkl"
 
 SIMILARITY_THRESHOLD = 0.45
 VIDEO_CONFIRM_COUNT = 4
-
-GEMINI_API_KEY = os.getenv(
-    "GEMINI_API_KEY",
-    ""
-)
-
-GEMINI_MODEL = "gemini-2.0-flash"
-
-GROQ_API_KEY = os.getenv(
-    "GROQ_API_KEY",
-    ""
-)
-
-GROQ_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-
-# Seconds between API calls
-API_COOLDOWN = 4
-
-last_api_call = 0
 
 IMAGE_EXTENSIONS = (
     ".jpg",
@@ -231,6 +327,11 @@ def sort_file(
         person_name
 ):
 
+    if not os.path.exists(
+            filepath
+    ):
+        return
+
     person_dir=os.path.join(
         OUTPUT_DIR,
         person_name
@@ -246,324 +347,61 @@ def sort_file(
         filename
     )
 
-    if not os.path.exists(
-            destination
-    ):
-
-        shutil.copy(
+    if os.path.exists(destination):
+        # Safety check: only delete if the file sizes match
+        if os.path.getsize(filepath) == os.path.getsize(destination):
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+        else:
+            print(f"\n  -> Warning: {filename} exists in {person_name} but has a different file size! Skipping deletion.")
+    else:
+        shutil.move(
             filepath,
             destination
         )
 
-
 # =========================================================
-# IDENTIFY CELEBRITY (API)
+# SUGGEST MATCH (EMBEDDING-BASED)
 # =========================================================
 
-CELEB_PROMPT = (
-    "Look at this image. "
-    "Identify the person in "
-    "this photo. If there are "
-    "multiple people, identify "
-    "the most prominent face. "
-    "Reply with ONLY their "
-    "full name in UPPERCASE. "
-    "If you cannot identify "
-    "them, reply with "
-    "exactly 'Unknown'."
-)
+# Minimum similarity to be suggested
+SUGGEST_THRESHOLD = 0.25
 
 
-def identify_via_gemini(image_b64):
+def suggest_match(embedding):
 
-    url = (
-        "https://generativelanguage"
-        ".googleapis.com/v1beta/"
-        f"models/{GEMINI_MODEL}"
-        ":generateContent"
-        f"?key={GEMINI_API_KEY}"
-    )
+    best_name = None
+    best_sim = -1
 
-    payload = {
-        "contents": [{
-            "parts": [
-                {
-                    "text": CELEB_PROMPT
-                },
-                {
-                    "inline_data": {
-                        "mime_type":
-                            "image/jpeg",
-                        "data":
-                            image_b64
-                    }
-                }
-            ]
-        }]
-    }
-
-    response = requests.post(
-        url,
-        json=payload,
-        timeout=15
-    )
-
-    data = response.json()
-
-    # Check for API errors
-    if 'error' in data:
-
-        msg = data[
-            'error'
-        ].get('message', '')
-
-        print(
-            f"  [Gemini: {msg[:80]}]"
-        )
-
-        return None
-
-    # Check for blocked response
-    if (
-        'candidates' not in data
-        or
-        len(data['candidates']) == 0
+    for saved_name, saved_emb in (
+            known_faces
     ):
 
-        block_reason = data.get(
-            'promptFeedback', {}
-        ).get(
-            'blockReason',
-            'unknown reason'
+        sim = cosine_similarity(
+            embedding,
+            saved_emb
         )
 
-        print(
-            f"  [Gemini blocked: "
-            f"{block_reason}]"
-        )
-
-        return None
-
-    # Check finish reason
-    finish = data[
-        'candidates'
-    ][0].get(
-        'finishReason',
-        ''
-    )
-
-    if finish == 'SAFETY':
-
-        print(
-            "  [Gemini blocked by "
-            "safety filter]"
-        )
-
-        return None
-
-    name = data[
-        'candidates'
-    ][0][
-        'content'
-    ][
-        'parts'
-    ][0][
-        'text'
-    ].strip()
-
-    if (
-        name.lower() == "unknown"
-        or
-        name == ""
-    ):
-        return None
-
-    return name
-
-
-def identify_via_groq(image_b64):
-
-    url = (
-        "https://api.groq.com"
-        "/openai/v1/"
-        "chat/completions"
-    )
-
-    headers = {
-        "Authorization":
-            f"Bearer {GROQ_API_KEY}",
-        "Content-Type":
-            "application/json"
-    }
-
-    payload = {
-        "model": GROQ_MODEL,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": CELEB_PROMPT
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url":
-                            "data:image/jpeg;"
-                            "base64,"
-                            + image_b64
-                    }
-                }
-            ]
-        }],
-        "max_tokens": 100
-    }
-
-    response = requests.post(
-        url,
-        headers=headers,
-        json=payload,
-        timeout=15
-    )
-
-    data = response.json()
-
-    # Check for API errors
-    if 'error' in data:
-
-        msg = data[
-            'error'
-        ].get('message', '')
-
-        print(
-            f"  [Groq: {msg[:80]}]"
-        )
-
-        return None
-
-    name = data[
-        'choices'
-    ][0][
-        'message'
-    ][
-        'content'
-    ].strip()
-
-    if (
-        name.lower() == "unknown"
-        or
-        name == ""
-    ):
-        return None
-
-    return name
-
-
-def identify_celebrity(
-        face_crop,
-        filepath=None,
-        frame=None
-):
-
-    global last_api_call
-
-    if (
-        not GEMINI_API_KEY
-        and
-        not GROQ_API_KEY
-    ):
-        return None
-
-    try:
-
-        # Rate limiting
-        elapsed = time.time() - last_api_call
-
-        if elapsed < API_COOLDOWN:
-
-            time.sleep(
-                API_COOLDOWN - elapsed
-            )
-
-        # Use full image if available
-        # (much better for identification)
-        image_b64 = None
-
-        if filepath and os.path.exists(
-                filepath
+        if (
+            sim > SUGGEST_THRESHOLD
+            and
+            sim > best_sim
         ):
 
-            ext = os.path.splitext(
-                filepath
-            )[1].lower()
+            best_sim = sim
+            best_name = saved_name
 
-            if ext in IMAGE_EXTENSIONS:
-
-                with open(
-                    filepath, 'rb'
-                ) as f:
-
-                    image_b64 = (
-                        base64.b64encode(
-                            f.read()
-                        ).decode()
-                    )
-
-        # Fallback to full frame (video)
-        if image_b64 is None and frame is not None:
-
-            _, buffer = cv2.imencode(
-                '.jpg',
-                frame
-            )
-
-            image_b64 = base64.b64encode(
-                buffer
-            ).decode()
-
-        # Fallback to face crop
-        if image_b64 is None:
-
-            _, buffer = cv2.imencode(
-                '.jpg',
-                face_crop
-            )
-
-            image_b64 = base64.b64encode(
-                buffer
-            ).decode()
-
-        last_api_call = time.time()
-
-        # Try Gemini first
-        if GEMINI_API_KEY:
-
-            result = identify_via_gemini(
-                image_b64
-            )
-
-            if result:
-                return result
-
-        # Fallback to Groq
-        if GROQ_API_KEY:
-
-            result = identify_via_groq(
-                image_b64
-            )
-
-            if result:
-                return result
-
-        return None
-
-    except Exception as e:
+    if best_name:
 
         print(
-            f"  [API error: {e}]"
+            f"  Best match: "
+            f"{best_name} "
+            f"({best_sim:.2f})"
         )
 
-        return None
+    return best_name
 
 
 # =========================================================
@@ -639,6 +477,12 @@ for filename in os.listdir(
             image
         )
 
+        if not faces:
+            continue
+            
+        # Only process the largest face (main person)
+        faces = [max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))]
+
         for face in faces:
 
             embedding=face.embedding
@@ -663,6 +507,7 @@ for filename in os.listdir(
                 unknown_queue.append({
                     'embedding':embedding,
                     'face_crop':face_crop,
+                    'bbox':face.bbox,
                     'filepath':filepath,
                     'filename':filename
                 })
@@ -687,6 +532,12 @@ for filename in os.listdir(
             faces=app.get(
                 frame
             )
+
+            if not faces:
+                continue
+                
+            # Only process the largest face (main person) in the frame
+            faces = [max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))]
 
             for face in faces:
 
@@ -745,6 +596,10 @@ for filename in os.listdir(
                                 'frame'
                             ]=frame.copy()
 
+                            existing[
+                                'bbox'
+                            ]=face.bbox
+
                             matched_existing=True
 
                             break
@@ -761,6 +616,8 @@ for filename in os.listdir(
                                 ),
                             'frame':
                                 frame.copy(),
+                            'bbox':
+                                face.bbox,
                             'count':1
                         })
 
@@ -780,6 +637,8 @@ for filename in os.listdir(
                         unknown['face_crop'],
                     'frame':
                         unknown['frame'],
+                    'bbox':
+                        unknown['bbox'],
                     'filepath':filepath,
                     'filename':filename
                 })
@@ -884,74 +743,32 @@ if len(unknown_queue)>0:
             f"\nFile: {filename}"
         )
 
-        # Try auto-identification
-        suggested=identify_celebrity(
-            face_crop,
-            filepath,
-            entry.get('frame')
+        # Try auto-suggestion
+        suggested=suggest_match(
+            embedding
         )
 
         if suggested:
 
             print(
-                f"Gemini suggests: "
+                f"  AI suggests: "
                 f"{suggested}"
             )
 
-            confirm=input(
-                "Confirm? "
-                "(y/yes/name/skip): "
-            ).strip()
+        name=input_prefilled(
+            "Enter name "
+            "(empty to skip): ",
+            suggested or ""
+        ).strip().strip("[](){}")
 
-            cv2.destroyAllWindows()
+        cv2.destroyAllWindows()
 
-            confirm=confirm.strip(
-                "[](){}"
-            )
-
-            if (
-                confirm.lower()=="y"
-                or
-                confirm.lower()=="yes"
-            ):
-
-                name=suggested
-
-            elif (
-                confirm==""
-                or
-                confirm.lower()=="skip"
-            ):
-
-                continue
-
-            else:
-
-                name=confirm
-
-        else:
-
-            if suggested is None and GEMINI_API_KEY:
-
-                print(
-                    "Could not auto-identify."
-                )
-
-            name=input(
-                "Enter name "
-                "(skip to ignore): "
-            ).strip()
-
-            cv2.destroyAllWindows()
-
-            name=name.strip("[](){}")
-
-            if (
-                name==""
-                or
-                name.lower()=="skip"
-            ):
-                continue
+        if (
+            name==""
+            or
+            name.lower()=="skip"
+        ):
+            continue
 
         # Save to memory
         known_faces.append(
@@ -1063,26 +880,6 @@ else:
     print(
         "\nNo unknown faces found."
     )
-
-
-# =========================================================
-# CLEANUP : DELETE SORTED ORIGINALS
-# =========================================================
-
-print(
-    "\n========== Cleanup =========="
-)
-
-for filepath in file_detections:
-
-    if os.path.exists(filepath):
-
-        os.remove(filepath)
-
-        print(
-            f"Removed: "
-            f"{file_detections[filepath]['filename']}"
-        )
 
 
 print(
