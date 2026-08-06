@@ -5,10 +5,13 @@ import pickle
 import ctypes
 import cv2
 import numpy as np
+import warnings
 
 from dotenv import load_dotenv
 from insightface.app import FaceAnalysis
 
+# Suppress FutureWarnings from insightface and its dependencies (like numpy and scikit-image)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 load_dotenv()
 
