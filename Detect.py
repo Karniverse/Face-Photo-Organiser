@@ -141,7 +141,7 @@ OUTPUT_DIR = "sorted_photos"
 MEMORY_FILE = "face_memory.pkl"
 
 SIMILARITY_THRESHOLD = 0.45
-VIDEO_CONFIRM_COUNT = 4
+VIDEO_CONFIRM_COUNT = 1
 
 IMAGE_EXTENSIONS = (
     ".jpg",
@@ -321,6 +321,43 @@ def crop_face(image,face):
 
 
 # =========================================================
+# GET MAIN FACE (SIZE + CENTER HEURISTIC)
+# =========================================================
+
+def get_main_face(faces, image_shape):
+
+    if not faces:
+        return []
+        
+    img_h, img_w = image_shape[:2]
+    img_center_x = img_w / 2
+    
+    best_face = None
+    best_score = -1
+    
+    for f in faces:
+        x1, y1, x2, y2 = f.bbox
+        area = (x2 - x1) * (y2 - y1)
+        
+        face_center_x = (x1 + x2) / 2
+        
+        # Calculate horizontal distance from center (0 to 1)
+        # People in portraits can be anywhere vertically, but are almost always horizontally centered!
+        dist_x = abs(face_center_x - img_center_x)
+        norm_dist_x = dist_x / (img_w / 2)
+        
+        # Heavy penalty for being off to the left or right side of the photo.
+        # A face at the extreme edge has its score reduced by up to 80%.
+        score = area * (1 - norm_dist_x * 0.8)
+        
+        if score > best_score:
+            best_score = score
+            best_face = f
+            
+    return [best_face] if best_face else []
+
+
+# =========================================================
 # SORT FILE TO PERSON FOLDER
 # =========================================================
 
@@ -350,17 +387,8 @@ def sort_file(
         filename
     )
 
-    if os.path.exists(destination):
-        # Safety check: only delete if the file sizes match
-        if os.path.getsize(filepath) == os.path.getsize(destination):
-            try:
-                os.remove(filepath)
-            except OSError:
-                pass
-        else:
-            print(f"\n  -> Warning: {filename} exists in {person_name} but has a different file size! Skipping deletion.")
-    else:
-        shutil.move(
+    if not os.path.exists(destination):
+        shutil.copy2(
             filepath,
             destination
         )
@@ -483,34 +511,28 @@ for filename in os.listdir(
         if not faces:
             continue
             
-        # Only process the largest face (main person)
-        faces = [max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))]
+        photo_has_known = False
+        photo_unknowns = []
 
         for face in faces:
-
             embedding=face.embedding
-
-            face_crop=crop_face(
-                image,
-                face
-            )
-
-            name=match_face(
-                embedding
-            )
+            name=match_face(embedding)
 
             if name!="Unknown":
-
-                detected_names.add(
-                    name
-                )
-
+                detected_names.add(name)
+                photo_has_known = True
             else:
-
+                photo_unknowns.append(face)
+                
+        # If no known faces were found, pick the MAIN unknown person to ask about
+        if not photo_has_known and photo_unknowns:
+            main_face = get_main_face(photo_unknowns, image.shape)
+            if main_face:
+                f = main_face[0]
                 unknown_queue.append({
-                    'embedding':embedding,
-                    'face_crop':face_crop,
-                    'bbox':face.bbox,
+                    'embedding':f.embedding,
+                    'face_crop':crop_face(image, f),
+                    'bbox':f.bbox,
                     'filepath':filepath,
                     'filename':filename
                 })
@@ -535,12 +557,9 @@ for filename in os.listdir(
             faces=app.get(
                 frame
             )
-
+            
             if not faces:
                 continue
-                
-            # Only process the largest face (main person) in the frame
-            faces = [max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))]
 
             for face in faces:
 
@@ -624,24 +643,21 @@ for filename in os.listdir(
                             'count':1
                         })
 
-        # Queue confirmed unknowns
-        for unknown in video_unknowns:
-
-            if (
-                unknown['count']
-                >=
-                VIDEO_CONFIRM_COUNT
-            ):
-
+        # Queue confirmed unknowns only if NO known faces were found
+        if not detected_names:
+            valid_unknowns = [u for u in video_unknowns if u['count'] >= VIDEO_CONFIRM_COUNT]
+            if valid_unknowns:
+                # Pick the unknown cluster with the largest bounding box area
+                best_unknown = max(valid_unknowns, key=lambda u: (u['bbox'][2]-u['bbox'][0]) * (u['bbox'][3]-u['bbox'][1]))
                 unknown_queue.append({
                     'embedding':
-                        unknown['embedding'],
+                        best_unknown['embedding'],
                     'face_crop':
-                        unknown['face_crop'],
+                        best_unknown['face_crop'],
                     'frame':
-                        unknown['frame'],
+                        best_unknown['frame'],
                     'bbox':
-                        unknown['bbox'],
+                        best_unknown['bbox'],
                     'filepath':filepath,
                     'filename':filename
                 })
@@ -883,6 +899,20 @@ else:
     print(
         "\nNo unknown faces found."
     )
+
+
+# =========================================================
+# PASS 3 : CLEANUP
+# =========================================================
+
+if file_detections:
+    print("\n========== PASS 3: Cleaning up original files ==========")
+    for filepath in file_detections.keys():
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except Exception as e:
+                print(f"  -> Could not remove original file {filepath}: {e}")
 
 
 print(
